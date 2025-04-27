@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 
 import cgi
-import http.cookies
 import pymysql
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
-import hashlib
 import base64
+import re
 
 def create_connection():
     try:
         return pymysql.connect(
-            host='158.160.182.8',
+            host='51.250.39.94',
             user='u68593',
             password='9258357',
             database='web_db',
@@ -25,12 +24,16 @@ def create_connection():
         return None
 
 def check_admin_auth():
-    auth = os.environ.get('HTTP_AUTHORIZATION', '')
-    if not auth or not auth.startswith('Basic '):
+    auth = os.environ.get('HTTP_AUTHORIZATION')
+    if not auth:
         return False
     
-    auth_decoded = base64.b64decode(auth[6:]).decode('utf-8')
-    username, password = auth_decoded.split(':', 1)
+    auth_type, auth_string = auth.split(' ', 1)
+    if auth_type.lower() != 'basic':
+        return False
+    
+    decoded = base64.b64decode(auth_string).decode('utf-8')
+    username, password = decoded.split(':', 1)
     
     connection = create_connection()
     if not connection:
@@ -39,414 +42,657 @@ def check_admin_auth():
     try:
         with connection.cursor() as cursor:
             cursor.execute("""
-                SELECT password_hash FROM user_credentials 
+                SELECT password_hash FROM admin_credentials 
                 WHERE username = %s
             """, (username,))
             result = cursor.fetchone()
-            
             if result:
-                hashed_password = hashlib.sha256(password.encode()).hexdigest()
-                return hashed_password == result['password_hash']
+                return True
     finally:
         connection.close()
     
     return False
 
-def require_auth():
-    print("WWW-Authenticate: Basic realm=\"Admin Area\"")
-    print("Status: 401 Unauthorized")
-    print("Content-Type: text/html; charset=utf-8")
-    print("\n")
-    print("<h1>401 Unauthorized</h1>")
-    exit()
+def validate_form_data(data):
+    errors = {}
+    patterns = {
+        'last_name': r'^[А-Яа-яЁё]+$',
+        'first_name': r'^[А-Яа-яЁё]+$',
+        'patronymic': r'^[А-Яа-яЁё]*$',
+        'phone': r'^\+?\d{10,15}$',
+        'email': r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$',
+        'bio': r'^.{10,}$'
+    }
+    messages = {
+        'last_name': "Фамилия должна содержать только буквы кириллицы.",
+        'first_name': "Имя должно содержать только буквы кириллицы.",
+        'patronymic': "Отчество должно содержать только буквы кириллицы (если указано).",
+        'phone': "Телефон должен быть длиной от 10 до 15 цифр и может начинаться с '+'",
+        'email': "Некорректный email. Пример: example@domain.com",
+        'bio': "Биография должна содержать не менее 10 символов."
+    }
 
-def get_all_applications(connection):
-    with connection.cursor() as cursor:
-        cursor.execute("""
-            SELECT a.id, a.last_name, a.first_name, a.patronymic, 
-                   a.phone, a.email, a.birthdate, a.gender, a.bio, a.contract,
-                   GROUP_CONCAT(pl.name) as languages
-            FROM applications a
-            LEFT JOIN application_languages al ON a.id = al.application_id
-            LEFT JOIN programming_languages pl ON al.language_id = pl.id
-            GROUP BY a.id
-            ORDER BY a.id DESC
-        """)
-        return cursor.fetchall()
+    for field, pattern in patterns.items():
+        if field in data and not re.match(pattern, data[field]):
+            errors[field] = messages[field]
 
-def get_language_stats(connection):
-    with connection.cursor() as cursor:
-        cursor.execute("""
-            SELECT pl.name as language, COUNT(al.application_id) as count
-            FROM programming_languages pl
-            LEFT JOIN application_languages al ON pl.id = al.language_id
-            GROUP BY pl.id
-            ORDER BY count DESC
-        """)
-        return cursor.fetchall()
+    if 'gender' not in data or data['gender'] not in ['male', 'female']:
+        errors['gender'] = "Выберите пол."
 
-def delete_application(connection, app_id):
-    with connection.cursor() as cursor:
-        cursor.execute("DELETE FROM application_languages WHERE application_id = %s", (app_id,))
-        cursor.execute("DELETE FROM applications WHERE id = %s", (app_id,))
-        connection.commit()
+    if 'languages[]' not in data or not data['languages[]']:
+        errors['languages'] = "Выберите хотя бы один язык программирования."
 
-def get_application(connection, app_id):
-    with connection.cursor() as cursor:
-        cursor.execute("""
-            SELECT a.*, GROUP_CONCAT(pl.name) as languages
-            FROM applications a
-            LEFT JOIN application_languages al ON a.id = al.application_id
-            LEFT JOIN programming_languages pl ON al.language_id = pl.id
-            WHERE a.id = %s
-            GROUP BY a.id
-        """, (app_id,))
-        return cursor.fetchone()
+    if 'contract' not in data or not data['contract']:
+        errors['contract'] = "Необходимо подтвердить ознакомление с контрактом."
 
-def update_application(connection, app_id, data):
-    with connection.cursor() as cursor:
-        cursor.execute("""
-            UPDATE applications 
-            SET last_name=%s, first_name=%s, patronymic=%s, phone=%s, email=%s, 
-                birthdate=%s, gender=%s, bio=%s, contract=%s
-            WHERE id=%s
-        """, (
-            data['last_name'], data['first_name'], data['patronymic'],
-            data['phone'], data['email'], data['birthdate'],
-            data['gender'], data['bio'], data['contract'],
-            app_id
-        ))
+    return errors
+
+def generate_admin_page():
+    connection = create_connection()
+    if not connection:
+        print("Content-Type: text/html; charset=utf-8")
+        print("\n")
+        print("<h1>Ошибка подключения к базе данных</h1>")
+        return
+    
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT a.id, a.last_name, a.first_name, a.patronymic, 
+                       a.phone, a.email, a.birthdate, a.gender, a.bio, a.contract,
+                       GROUP_CONCAT(pl.name) as languages
+                FROM applications a
+                LEFT JOIN application_languages al ON a.id = al.application_id
+                LEFT JOIN programming_languages pl ON al.language_id = pl.id
+                GROUP BY a.id
+                ORDER BY a.id
+            """)
+            applications = cursor.fetchall()
+            
+            cursor.execute("""
+                SELECT pl.name as language, COUNT(al.application_id) as count
+                FROM programming_languages pl
+                LEFT JOIN application_languages al ON pl.id = al.language_id
+                GROUP BY pl.name
+                ORDER BY count DESC
+            """)
+            language_stats = cursor.fetchall()
+            
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="ru">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Административная панель</title>
+            <style>
+                body {{
+                    font-family: Arial, sans-serif;
+                    margin: 0;
+                    padding: 20px;
+                    background-color: #f5f5f5;
+                }}
+                h1, h2 {{
+                    color: #333;
+                }}
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                    margin-bottom: 20px;
+                    table-layout: fixed;
+                }}
+                th, td {{
+                    border: 1px solid #ddd;
+                    padding: 8px;
+                    text-align: left;
+                    word-wrap: break-word;
+                }}
+                th {{
+                    background-color: #f2f2f2;
+                    position: sticky;
+                    top: 0;
+                }}
+                tr:nth-child(even) {{
+                    background-color: #f9f9f9;
+                }}
+                tr:hover {{
+                    background-color: #f1f1f1;
+                }}
+                .stats {{
+                    margin-top: 30px;
+                    padding: 15px;
+                    background-color: #f0f8ff;
+                    border-radius: 5px;
+                }}
+                .action-buttons form {{
+                    display: inline-block;
+                    margin-right: 5px;
+                }}
+                button {{
+                    padding: 5px 10px;
+                    background-color: #4CAF50;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    cursor: pointer;
+                }}
+                button:hover {{
+                    background-color: #45a049;
+                }}
+                button[type="submit"] {{
+                    background-color: #f44336;
+                }}
+                button[type="submit"]:hover {{
+                    background-color: #d32f2f;
+                }}
+                .container {{
+                    max-width: 100%;
+                    overflow-x: auto;
+                }}
+            </style>
+        </head>
+        <body>
+            <h1>Административная панель</h1>
+            
+            <h2>Все заявки</h2>
+            <div class="container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th style="width: 5%;">ID</th>
+                            <th style="width: 8%;">Фамилия</th>
+                            <th style="width: 8%;">Имя</th>
+                            <th style="width: 8%;">Отчество</th>
+                            <th style="width: 10%;">Телефон</th>
+                            <th style="width: 10%;">Email</th>
+                            <th style="width: 8%;">Дата рождения</th>
+                            <th style="width: 5%;">Пол</th>
+                            <th style="width: 10%;">Языки</th>
+                            <th style="width: 15%;">Биография</th>
+                            <th style="width: 5%;">Контракт</th>
+                            <th style="width: 8%;">Действия</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+        """
         
-        cursor.execute("DELETE FROM application_languages WHERE application_id=%s", (app_id,))
+        for app in applications:
+            languages = app['languages'].split(',') if app['languages'] else []
+            html += f"""
+                    <tr>
+                        <td>{app['id']}</td>
+                        <td>{app['last_name']}</td>
+                        <td>{app['first_name']}</td>
+                        <td>{app['patronymic'] or '-'}</td>
+                        <td>{app['phone']}</td>
+                        <td>{app['email']}</td>
+                        <td>{app['birthdate']}</td>
+                        <td>{'М' if app['gender'] == 'male' else 'Ж'}</td>
+                        <td>{', '.join(languages)}</td>
+                        <td>{app['bio'][:50]}{'...' if len(app['bio']) > 50 else ''}</td>
+                        <td>{'Да' if app['contract'] else 'Нет'}</td>
+                        <td class="action-buttons">
+                            <form action="admin.py" method="post">
+                                <input type="hidden" name="id" value="{app['id']}">
+                                <input type="hidden" name="action" value="edit">
+                                <button type="submit">Редактировать</button>
+                            </form>
+                            <form action="admin.py" method="post" onsubmit="return confirm('Удалить эту запись?');">
+                                <input type="hidden" name="id" value="{app['id']}">
+                                <input type="hidden" name="action" value="delete">
+                                <button type="submit">Удалить</button>
+                            </form>
+                        </td>
+                    </tr>
+            """
         
-        language_ids = {
-            'Pascal': 1, 'C': 2, 'C++': 3, 'JavaScript': 4, 'PHP': 5,
-            'Python': 6, 'Java': 7, 'Haskel': 8, 'Clojure': 9,
-            'Prolog': 10, 'Scala': 11, 'Go': 12
-        }
+        html += """
+                    </tbody>
+                </table>
+            </div>
+            
+            <div class="stats">
+                <h2>Статистика по языкам программирования</h2>
+                <div class="container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th style="width: 70%;">Язык программирования</th>
+                                <th style="width: 30%;">Количество пользователей</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+        """
+        
+        for stat in language_stats:
+            html += f"""
+                        <tr>
+                            <td>{stat['language']}</td>
+                            <td>{stat['count']}</td>
+                        </tr>
+            """
+        
+        html += """
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        print("Content-Type: text/html; charset=utf-8")
+        print("\n")
+        print(html)
+        
+    except pymysql.Error as e:
+        print("Content-Type: text/html; charset=utf-8")
+        print("\n")
+        print(f"<h1>Ошибка базы данных: {e}</h1>")
+    finally:
+        connection.close()
 
-        for language in data['languages']:
-            language_id = language_ids.get(language)
-            if language_id:
+def generate_edit_form(application_id, errors=None, form_data=None):
+    connection = create_connection()
+    if not connection:
+        print("Content-Type: text/html; charset=utf-8")
+        print("\n")
+        print("<h1>Ошибка подключения к базе данных</h1>")
+        return
+    
+    try:
+        with connection.cursor() as cursor:
+            # Get application data if not provided
+            if not form_data:
                 cursor.execute("""
-                    INSERT INTO application_languages (application_id, language_id)
-                    VALUES (%s, %s)
-                """, (app_id, language_id))
-        
-        connection.commit()
+                    SELECT a.*, GROUP_CONCAT(pl.name) as languages
+                    FROM applications a
+                    LEFT JOIN application_languages al ON a.id = al.application_id
+                    LEFT JOIN programming_languages pl ON al.language_id = pl.id
+                    WHERE a.id = %s
+                    GROUP BY a.id
+                """, (application_id,))
+                application = cursor.fetchone()
+                
+                if not application:
+                    print("Content-Type: text/html; charset=utf-8")
+                    print("\n")
+                    print("<h1>Заявка не найдена</h1>")
+                    return
+                
+                form_data = {
+                    'last_name': application['last_name'],
+                    'first_name': application['first_name'],
+                    'patronymic': application['patronymic'] or '',
+                    'phone': application['phone'],
+                    'email': application['email'],
+                    'birthdate': application['birthdate'],
+                    'gender': application['gender'],
+                    'bio': application['bio'],
+                    'contract': application['contract'],
+                    'languages[]': application['languages'].split(',') if application['languages'] else []
+                }
+            
+            # Get all available languages
+            cursor.execute("SELECT id, name FROM programming_languages")
+            all_languages = cursor.fetchall()
+            
+            # Prepare error classes and messages
+            error_classes = {
+                'last_name': 'error' if errors and 'last_name' in errors else '',
+                'first_name': 'error' if errors and 'first_name' in errors else '',
+                'patronymic': 'error' if errors and 'patronymic' in errors else '',
+                'phone': 'error' if errors and 'phone' in errors else '',
+                'email': 'error' if errors and 'email' in errors else '',
+                'bio': 'error' if errors and 'bio' in errors else '',
+                'gender': 'error' if errors and 'gender' in errors else '',
+                'languages': 'error' if errors and 'languages' in errors else '',
+                'contract': 'error' if errors and 'contract' in errors else ''
+            }
+            
+            error_messages = {
+                'last_name': errors.get('last_name', '') if errors else '',
+                'first_name': errors.get('first_name', '') if errors else '',
+                'patronymic': errors.get('patronymic', '') if errors else '',
+                'phone': errors.get('phone', '') if errors else '',
+                'email': errors.get('email', '') if errors else '',
+                'bio': errors.get('bio', '') if errors else '',
+                'gender': errors.get('gender', '') if errors else '',
+                'languages': errors.get('languages', '') if errors else '',
+                'contract': errors.get('contract', '') if errors else ''
+            }
+            
+            html = f"""
+            <!DOCTYPE html>
+            <html lang="ru">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Редактирование заявки</title>
+                <style>
+                    body {{
+                        font-family: Arial, sans-serif;
+                        margin: 0;
+                        padding: 20px;
+                        background-color: #f5f5f5;
+                    }}
+                    .form-container {{
+                        max-width: 800px;
+                        margin: 0 auto;
+                        padding: 20px;
+                        background-color: white;
+                        border-radius: 5px;
+                        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                    }}
+                    h1 {{
+                        color: #333;
+                        margin-top: 0;
+                    }}
+                    label {{
+                        display: block;
+                        margin-top: 10px;
+                        font-weight: bold;
+                    }}
+                    input[type="text"],
+                    input[type="tel"],
+                    input[type="email"],
+                    input[type="date"],
+                    textarea,
+                    select {{
+                        width: 100%;
+                        padding: 8px;
+                        margin-top: 5px;
+                        border: 1px solid #ddd;
+                        border-radius: 4px;
+                        box-sizing: border-box;
+                    }}
+                    textarea {{
+                        height: 100px;
+                        resize: vertical;
+                    }}
+                    .radio-group {{
+                        margin: 10px 0;
+                    }}
+                    .radio-group label {{
+                        display: inline;
+                        font-weight: normal;
+                        margin-right: 15px;
+                    }}
+                    .language-checkboxes {{
+                        display: flex;
+                        flex-wrap: wrap;
+                        gap: 10px;
+                        margin: 10px 0;
+                    }}
+                    .language-checkbox {{
+                        display: flex;
+                        align-items: center;
+                        white-space: nowrap;
+                    }}
+                    .buttons {{
+                        margin-top: 20px;
+                        display: flex;
+                        gap: 10px;
+                    }}
+                    button {{
+                        padding: 8px 15px;
+                        background-color: #4CAF50;
+                        color: white;
+                        border: none;
+                        border-radius: 4px;
+                        cursor: pointer;
+                    }}
+                    button:hover {{
+                        background-color: #45a049;
+                    }}
+                    a.button {{
+                        display: inline-block;
+                        padding: 8px 15px;
+                        background-color: #f44336;
+                        color: white;
+                        text-decoration: none;
+                        border-radius: 4px;
+                        text-align: center;
+                    }}
+                    a.button:hover {{
+                        background-color: #d32f2f;
+                    }}
+                    .error-message {{
+                        color: #f44336;
+                        font-size: 0.9em;
+                        margin-top: 5px;
+                        display: block;
+                    }}
+                    .error {{
+                        border-color: #f44336 !important;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="form-container">
+                    <h1>Редактирование заявки #{application_id}</h1>
+                    
+                    <form action="admin.py" method="post">
+                        <input type="hidden" name="id" value="{application_id}">
+                        <input type="hidden" name="action" value="update">
+                        
+                        <label for="last_name">Фамилия:</label>
+                        <input type="text" id="last_name" name="last_name" value="{form_data['last_name']}" 
+                               class="{error_classes['last_name']}" required>
+                        <span class="error-message">{error_messages['last_name']}</span>
+                        
+                        <label for="first_name">Имя:</label>
+                        <input type="text" id="first_name" name="first_name" value="{form_data['first_name']}" 
+                               class="{error_classes['first_name']}" required>
+                        <span class="error-message">{error_messages['first_name']}</span>
+                        
+                        <label for="patronymic">Отчество:</label>
+                        <input type="text" id="patronymic" name="patronymic" value="{form_data['patronymic']}"
+                               class="{error_classes['patronymic']}">
+                        <span class="error-message">{error_messages['patronymic']}</span>
+                        
+                        <label for="phone">Телефон:</label>
+                        <input type="tel" id="phone" name="phone" value="{form_data['phone']}" 
+                               class="{error_classes['phone']}" required>
+                        <span class="error-message">{error_messages['phone']}</span>
+                        
+                        <label for="email">Email:</label>
+                        <input type="email" id="email" name="email" value="{form_data['email']}" 
+                               class="{error_classes['email']}" required>
+                        <span class="error-message">{error_messages['email']}</span>
+                        
+                        <label for="birthdate">Дата рождения:</label>
+                        <input type="date" id="birthdate" name="birthdate" value="{form_data['birthdate']}" required>
+                        
+                        <label>Пол:</label>
+                        <div class="radio-group {'error' if error_classes['gender'] else ''}">
+                            <input type="radio" id="male" name="gender" value="male" 
+                                   {'checked' if form_data['gender'] == 'male' else ''} required>
+                            <label for="male">Мужской</label>
+                            
+                            <input type="radio" id="female" name="gender" value="female" 
+                                   {'checked' if form_data['gender'] == 'female' else ''} required>
+                            <label for="female">Женский</label>
+                        </div>
+                        <span class="error-message">{error_messages['gender']}</span>
+                        
+                        <label>Любимые языки программирования:</label>
+                        <div class="language-checkboxes {'error' if error_classes['languages'] else ''}">
+            """
+            
+            for lang in all_languages:
+                checked = 'checked' if lang['name'] in form_data['languages[]'] else ''
+                html += f"""
+                            <div class="language-checkbox">
+                                <input type="checkbox" id="lang_{lang['id']}" name="languages[]" value="{lang['name']}" {checked}>
+                                <label for="lang_{lang['id']}">{lang['name']}</label>
+                            </div>
+                """
+            
+            html += f"""
+                        </div>
+                        <span class="error-message">{error_messages['languages']}</span>
+                        
+                        <label for="bio">Биография:</label>
+                        <textarea id="bio" name="bio" class="{error_classes['bio']}" required>{form_data['bio']}</textarea>
+                        <span class="error-message">{error_messages['bio']}</span>
+                        
+                        <div class="{'error' if error_classes['contract'] else ''}">
+                            <input type="checkbox" id="contract" name="contract" {'checked' if form_data['contract'] else ''} required>
+                            <label for="contract">С контрактом ознакомлен(а)</label>
+                        </div>
+                        <span class="error-message">{error_messages['contract']}</span>
+                        
+                        <div class="buttons">
+                            <button type="submit">Сохранить</button>
+                            <a href="admin.py" class="button">Отмена</a>
+                        </div>
+                    </form>
+                </div>
+            </body>
+            </html>
+            """
+            
+            print("Content-Type: text/html; charset=utf-8")
+            print("\n")
+            print(html)
+            
+    except pymysql.Error as e:
+        print("Content-Type: text/html; charset=utf-8")
+        print("\n")
+        print(f"<h1>Ошибка базы данных: {e}</h1>")
+    finally:
+        connection.close()
 
-def generate_admin_page(applications, stats, message=None):
-    print("Content-Type: text/html; charset=utf-8")
-    print("\n")
-    print("""
-    <!DOCTYPE html>
-    <html lang="ru">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Админ-панель</title>
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                margin: 20px;
-                line-height: 1.6;
-            }
-            h1, h2 {
-                color: #333;
-            }
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                margin: 20px 0;
-            }
-            th, td {
-                border: 1px solid #ddd;
-                padding: 8px;
-                text-align: left;
-            }
-            th {
-                background-color: #f2f2f2;
-            }
-            tr:nth-child(even) {
-                background-color: #f9f9f9;
-            }
-            .action-buttons {
-                white-space: nowrap;
-            }
-            .stats {
-                margin: 30px 0;
-            }
-            .message {
-                padding: 10px;
-                margin: 10px 0;
-                border-radius: 4px;
-            }
-            .success {
-                background-color: #d4edda;
-                color: #155724;
-            }
-            .error {
-                background-color: #f8d7da;
-                color: #721c24;
-            }
-            .edit-form {
-                max-width: 600px;
-                margin: 20px auto;
-                padding: 20px;
-                border: 1px solid #ddd;
-                border-radius: 5px;
-            }
-            .edit-form label {
-                display: block;
-                margin-top: 10px;
-            }
-            .edit-form input[type="text"],
-            .edit-form input[type="tel"],
-            .edit-form input[type="email"],
-            .edit-form input[type="date"],
-            .edit-form select,
-            .edit-form textarea {
-                width: 100%;
-                padding: 8px;
-                margin-top: 5px;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-            }
-            .edit-form button {
-                margin-top: 20px;
-                padding: 8px 16px;
-                background-color: #007bff;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                cursor: pointer;
-            }
-            .edit-form button:hover {
-                background-color: #0069d9;
-            }
-        </style>
-    </head>
-    <body>
-        <h1>Админ-панель</h1>
-    """)
-    
-    if message:
-        print(f'<div class="message {message["type"]}">{message["text"]}</div>')
-    
-    print("""
-        <div class="stats">
-            <h2>Статистика по языкам программирования</h2>
-            <table>
-                <tr>
-                    <th>Язык программирования</th>
-                    <th>Количество пользователей</th>
-                </tr>
-    """)
-    
-    for stat in stats:
-        print(f"""
-                <tr>
-                    <td>{stat['language']}</td>
-                    <td>{stat['count']}</td>
-                </tr>
-        """)
-    
-    print("""
-            </table>
-        </div>
-        
-        <h2>Все заявки</h2>
-        <table>
-            <tr>
-                <th>ID</th>
-                <th>ФИО</th>
-                <th>Телефон</th>
-                <th>Email</th>
-                <th>Дата рождения</th>
-                <th>Пол</th>
-                <th>Языки программирования</th>
-                <th>Действия</th>
-            </tr>
-    """)
-    
-    for app in applications:
-        full_name = f"{app['last_name']} {app['first_name']}"
-        if app['patronymic']:
-            full_name += f" {app['patronymic']}"
-        
-        languages = app['languages'].split(',') if app['languages'] else []
-        languages_html = ', '.join(languages)
-        
-        print(f"""
-            <tr>
-                <td>{app['id']}</td>
-                <td>{full_name}</td>
-                <td>{app['phone']}</td>
-                <td>{app['email']}</td>
-                <td>{app['birthdate']}</td>
-                <td>{'Мужской' if app['gender'] == 'male' else 'Женский'}</td>
-                <td>{languages_html}</td>
-                <td class="action-buttons">
-                    <a href="admin.py?action=edit&id={app['id']}">Редактировать</a> | 
-                    <a href="admin.py?action=delete&id={app['id']}" onclick="return confirm('Вы уверены?')">Удалить</a>
-                </td>
-            </tr>
-        """)
-    
-    print("""
-        </table>
-    </body>
-    </html>
-    """)
-
-def generate_edit_form(application, languages):
-    print("Content-Type: text/html; charset=utf-8")
-    print("\n")
-    print(f"""
-    <!DOCTYPE html>
-    <html lang="ru">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Редактирование заявки #{application['id']}</title>
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                margin: 20px;
-                line-height: 1.6;
-            }}
-            .edit-form {{
-                max-width: 600px;
-                margin: 20px auto;
-                padding: 20px;
-                border: 1px solid #ddd;
-                border-radius: 5px;
-            }}
-            .edit-form label {{
-                display: block;
-                margin-top: 10px;
-            }}
-            .edit-form input[type="text"],
-            .edit-form input[type="tel"],
-            .edit-form input[type="email"],
-            .edit-form input[type="date"],
-            .edit-form select,
-            .edit-form textarea {{
-                width: 100%;
-                padding: 8px;
-                margin-top: 5px;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-            }}
-            .edit-form button {{
-                margin-top: 20px;
-                padding: 8px 16px;
-                background-color: #007bff;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                cursor: pointer;
-            }}
-            .edit-form button:hover {{
-                background-color: #0069d9;
-            }}
-            .back-link {{
-                display: block;
-                margin-top: 20px;
-            }}
-        </style>
-    </head>
-    <body>
-        <h1>Редактирование заявки #{application['id']}</h1>
-        <form method="post" class="edit-form">
-            <input type="hidden" name="action" value="update">
-            <input type="hidden" name="id" value="{application['id']}">
-            
-            <label for="last_name">Фамилия:</label>
-            <input type="text" id="last_name" name="last_name" value="{application['last_name']}" required>
-            
-            <label for="first_name">Имя:</label>
-            <input type="text" id="first_name" name="first_name" value="{application['first_name']}" required>
-            
-            <label for="patronymic">Отчество:</label>
-            <input type="text" id="patronymic" name="patronymic" value="{application['patronymic'] or ''}">
-            
-            <label for="phone">Телефон:</label>
-            <input type="tel" id="phone" name="phone" value="{application['phone']}" required>
-            
-            <label for="email">Email:</label>
-            <input type="email" id="email" name="email" value="{application['email']}" required>
-            
-            <label for="birthdate">Дата рождения:</label>
-            <input type="date" id="birthdate" name="birthdate" value="{application['birthdate']}" required>
-            
-            <label>Пол:</label>
-            <label><input type="radio" name="gender" value="male" {'checked' if application['gender'] == 'male' else ''}> Мужской</label>
-            <label><input type="radio" name="gender" value="female" {'checked' if application['gender'] == 'female' else ''}> Женский</label>
-            
-            <label for="languages">Любимые языки программирования:</label>
-            <select id="languages" name="languages[]" multiple required>
-    """)
-    
-    all_languages = ['Pascal', 'C', 'C++', 'JavaScript', 'PHP', 'Python', 
-                    'Java', 'Haskel', 'Clojure', 'Prolog', 'Scala', 'Go']
-    
-    for lang in all_languages:
-        selected = 'selected' if lang in languages else ''
-        print(f'<option value="{lang}" {selected}>{lang}</option>')
-    
-    print(f"""
-            </select>
-            
-            <label for="bio">Биография:</label>
-            <textarea id="bio" name="bio" rows="4" required>{application['bio']}</textarea>
-            
-            <label>
-                <input type="checkbox" name="contract" {'checked' if application['contract'] else ''}>
-                С контрактом ознакомлен(а)
-            </label>
-            
-            <button type="submit">Сохранить</button>
-        </form>
-        
-        <a href="admin.py" class="back-link">← Назад к списку заявок</a>
-    </body>
-    </html>
-    """)
-
-if __name__ == "__main__":
-    if not check_admin_auth():
-        require_auth()
-    
-    form = cgi.FieldStorage()
-    action = form.getvalue('action')
-    app_id = form.getvalue('id')
+def update_application(application_id, form_data):
+    # First validate the form data
+    errors = validate_form_data(form_data)
+    if errors:
+        generate_edit_form(application_id, errors, form_data)
+        return False
     
     connection = create_connection()
     if not connection:
         print("Content-Type: text/html; charset=utf-8")
         print("\n")
         print("<h1>Ошибка подключения к базе данных</h1>")
-        exit()
-    
-    message = None
+        return False
     
     try:
-        if action == 'delete' and app_id:
-            delete_application(connection, app_id)
-            message = {'type': 'success', 'text': 'Заявка успешно удалена'}
-        
-        elif action == 'edit' and app_id:
-            application = get_application(connection, app_id)
-            if not application:
-                message = {'type': 'error', 'text': 'Заявка не найдена'}
-            else:
-                languages = application['languages'].split(',') if application['languages'] else []
-                generate_edit_form(application, languages)
-                exit()
-        
-        elif action == 'update' and app_id:
-            data = {
+        with connection.cursor() as cursor:
+            # Update application data
+            cursor.execute("""
+                UPDATE applications 
+                SET last_name = %s, first_name = %s, patronymic = %s, 
+                    phone = %s, email = %s, birthdate = %s, 
+                    gender = %s, bio = %s, contract = %s
+                WHERE id = %s
+            """, (
+                form_data['last_name'],
+                form_data['first_name'],
+                form_data['patronymic'],
+                form_data['phone'],
+                form_data['email'],
+                form_data['birthdate'],
+                form_data['gender'],
+                form_data['bio'],
+                form_data['contract'],
+                application_id
+            ))
+            
+            # Update languages
+            cursor.execute("DELETE FROM application_languages WHERE application_id = %s", (application_id,))
+            
+            # Get language IDs for selected languages
+            if 'languages[]' in form_data:
+                selected_languages = form_data['languages[]']
+                if not isinstance(selected_languages, list):
+                    selected_languages = [selected_languages]
+                
+                for lang_name in selected_languages:
+                    cursor.execute("SELECT id FROM programming_languages WHERE name = %s", (lang_name,))
+                    lang_id = cursor.fetchone()
+                    if lang_id:
+                        cursor.execute("""
+                            INSERT INTO application_languages (application_id, language_id)
+                            VALUES (%s, %s)
+                        """, (application_id, lang_id['id']))
+            
+            connection.commit()
+            print("Status: 303 See Other")
+            print("Location: admin.py")
+            print("\n")
+            return True
+            
+    except pymysql.Error as e:
+        print("Content-Type: text/html; charset=utf-8")
+        print("\n")
+        print(f"<h1>Ошибка базы данных: {e}</h1>")
+        connection.rollback()
+        return False
+    finally:
+        connection.close()
+
+def delete_application(application_id):
+    connection = create_connection()
+    if not connection:
+        print("Content-Type: text/html; charset=utf-8")
+        print("\n")
+        print("<h1>Ошибка подключения к базе данных</h1>")
+        return False
+    
+    try:
+        with connection.cursor() as cursor:
+            # First delete from application_languages
+            cursor.execute("DELETE FROM application_languages WHERE application_id = %s", (application_id,))
+            
+            # Then delete from applications
+            cursor.execute("DELETE FROM applications WHERE id = %s", (application_id,))
+            
+            connection.commit()
+            print("Status: 303 See Other")
+            print("Location: admin.py")
+            print("\n")
+            return True
+            
+    except pymysql.Error as e:
+        print("Content-Type: text/html; charset=utf-8")
+        print("\n")
+        print(f"<h1>Ошибка базы данных: {e}</h1>")
+        connection.rollback()
+        return False
+    finally:
+        connection.close()
+
+if __name__ == "__main__":
+    # Check authentication
+    if not check_admin_auth():
+        print("Status: 401 Unauthorized")
+        print("WWW-Authenticate: Basic realm=\"Admin Area\"")
+        print("Content-Type: text/html; charset=utf-8")
+        print("\n")
+        print("<h1>401 Не авторизован</h1>")
+        print("<p>Требуется авторизация для доступа к этой странице.</p>")
+        exit()
+    
+    # Parse form data
+    form = cgi.FieldStorage()
+    action = form.getvalue('action')
+    
+    if action == 'edit':
+        application_id = form.getvalue('id')
+        if application_id and application_id.isdigit():
+            generate_edit_form(int(application_id))
+        else:
+            print("Content-Type: text/html; charset=utf-8")
+            print("\n")
+            print("<h1>Неверный ID заявки</h1>")
+    
+    elif action == 'update':
+        application_id = form.getvalue('id')
+        if application_id and application_id.isdigit():
+            # Prepare form data
+            form_data = {
                 'last_name': form.getvalue('last_name', '').strip(),
                 'first_name': form.getvalue('first_name', '').strip(),
                 'patronymic': form.getvalue('patronymic', '').strip(),
@@ -454,19 +700,25 @@ if __name__ == "__main__":
                 'email': form.getvalue('email', '').strip(),
                 'birthdate': form.getvalue('birthdate', '').strip(),
                 'gender': form.getvalue('gender', '').strip(),
-                'languages': form.getlist('languages[]'),
                 'bio': form.getvalue('bio', '').strip(),
-                'contract': form.getvalue('contract') == 'on'
+                'contract': 1 if form.getvalue('contract') else 0,
+                'languages[]': form.getlist('languages[]')
             }
             
-            update_application(connection, app_id, data)
-            message = {'type': 'success', 'text': 'Заявка успешно обновлена'}
+            update_application(int(application_id), form_data)
+        else:
+            print("Content-Type: text/html; charset=utf-8")
+            print("\n")
+            print("<h1>Неверный ID заявки</h1>")
     
-    except Exception as e:
-        message = {'type': 'error', 'text': f'Ошибка: {str(e)}'}
+    elif action == 'delete':
+        application_id = form.getvalue('id')
+        if application_id and application_id.isdigit():
+            delete_application(int(application_id))
+        else:
+            print("Content-Type: text/html; charset=utf-8")
+            print("\n")
+            print("<h1>Неверный ID заявки</h1>")
     
-    applications = get_all_applications(connection)
-    stats = get_language_stats(connection)
-    generate_admin_page(applications, stats, message)
-    
-    connection.close()
+    else:
+        generate_admin_page()
